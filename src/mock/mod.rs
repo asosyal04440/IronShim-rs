@@ -3,7 +3,7 @@ use core::ptr::NonNull;
 
 use crate::{
     DmaAllocator, DmaHandle, Error, InterruptBudget, InterruptHandler, InterruptMetrics,
-    InterruptRegistry, PhysAddr,
+    InterruptRegistry, PhysAddr, QuarantineReason, ResourcePolicy,
 };
 
 use std::boxed::Box;
@@ -44,12 +44,34 @@ impl DmaAllocator for MockDmaAllocator {
             return Err(Error::OutOfMemory);
         }
         self.cursor.set(end);
+        // SAFETY: `offset..end` has been bounds-checked against `buffer`, and the returned pointer
+        // is used as an owned DMA allocation with `count * size_of::<T>()` bytes.
         let ptr = unsafe { self.buffer.as_ptr().add(offset) as *mut T };
         let phys = self.phys_base + offset;
         DmaHandle::from_raw(self, ptr, phys, count)
     }
 
     fn free<T>(&self, _phys: PhysAddr, _count: usize) {}
+}
+
+pub struct AllowAllPolicy;
+
+impl ResourcePolicy for AllowAllPolicy {
+    fn mmio_read(&self, _base: usize, _offset: usize, _size: usize) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn mmio_write(&self, _base: usize, _offset: usize, _size: usize) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn port_read(&self, _base: u16, _offset: u16, _size: u16) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn port_write(&self, _base: u16, _offset: u16, _size: u16) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 pub struct MockInterruptRegistry {
@@ -77,7 +99,12 @@ impl MockInterruptRegistry {
                     metrics: InterruptMetrics {
                         latency_ticks: 0,
                         missed: 0,
+                        irq_calls: 0,
+                        deferred_runs: 0,
+                        dma_map_ops: 0,
+                        dma_unmap_ops: 0,
                         budget_violations: 0,
+                        quarantine_reason: None,
                     },
                 };
                 size
@@ -139,13 +166,23 @@ impl InterruptRegistry for MockInterruptRegistry {
         if slot.calls >= slot.budget.max_calls || elapsed_ticks > slot.budget.max_ticks {
             slot.quarantined = true;
             slot.metrics.budget_violations = slot.metrics.budget_violations.saturating_add(1);
+            slot.metrics.quarantine_reason = Some(if elapsed_ticks > slot.budget.max_ticks {
+                QuarantineReason::TimeoutFault
+            } else {
+                QuarantineReason::BudgetExceeded
+            });
             return Err(Error::BudgetExceeded);
         }
         let mut handler = slot.handler.ok_or(Error::ResourceNotGranted)?;
+        // SAFETY: the slot stores the unique leaked handler pointer registered for this IRQ and we
+        // borrow it mutably only for the duration of this dispatch.
         let result = unsafe { handler.as_mut().handle(irq) };
         slot.calls = slot.calls.saturating_add(1);
+        slot.metrics.irq_calls = slot.metrics.irq_calls.saturating_add(1);
+        slot.metrics.latency_ticks = elapsed_ticks;
         if result.is_err() {
             slot.quarantined = true;
+            slot.metrics.quarantine_reason = Some(QuarantineReason::HandlerFault);
             return Err(Error::Quarantined);
         }
         Ok(())
@@ -159,6 +196,7 @@ impl InterruptRegistry for MockInterruptRegistry {
         }
         table[index].quarantined = false;
         table[index].calls = 0;
+        table[index].metrics.quarantine_reason = None;
         Ok(())
     }
 

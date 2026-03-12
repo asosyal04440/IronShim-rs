@@ -2,16 +2,23 @@
 name = "ironshim-rs"
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-only"
 
 [lib]
 path = "src/lib.rs"
 
 [features]
 default = []
+std = []
 alloc = []
 loom = ["dep:loom"]
 fuzzing = []
+linux-host = ["std", "dep:libc"]
+kani = []
 
 [dependencies]
+libc = { version = "0.2", optional = true }
 loom = { version = "0.7", optional = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

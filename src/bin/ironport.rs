@@ -1,13 +1,20 @@
+#[path = "shared/tooling_support.rs"]
+mod tooling_support;
+
+use ironshim_rs::crypto::Sha256;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use ironshim_rs::crypto::{hmac_sha256, Sha256};
+use std::time::Duration;
+use tooling_support::{
+    current_epoch, hash_bytes as shared_hash_bytes, intoto_path, json_escape, sign_blob, slsa_path,
+    spdx_path,
+};
 
 fn main() {
     let mut args = env::args().skip(1).collect::<Vec<_>>();
@@ -166,13 +173,23 @@ fn apply_patterns(
     let content = fs::read_to_string(input)?;
     let pattern_data = parse_pattern(pattern)?;
     if let Some(expected) = linux_version {
-        if pattern_data.metadata.linux_version != "unknown" && pattern_data.metadata.linux_version != expected {
-            return Err(io::Error::new(io::ErrorKind::Other, "linux version mismatch"));
+        if pattern_data.metadata.linux_version != "unknown"
+            && pattern_data.metadata.linux_version != expected
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "linux version mismatch",
+            ));
         }
     }
     if let Some(expected) = driver_family {
-        if pattern_data.metadata.driver_family != "unknown" && pattern_data.metadata.driver_family != expected {
-            return Err(io::Error::new(io::ErrorKind::Other, "driver family mismatch"));
+        if pattern_data.metadata.driver_family != "unknown"
+            && pattern_data.metadata.driver_family != expected
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "driver family mismatch",
+            ));
         }
     }
     if pattern_data.metadata.review_required && pattern_data.metadata.confidence < 0.75 && !force {
@@ -221,6 +238,7 @@ fn apply_patterns(
         }
     }
     let _ = write_output_provenance(output, input, &pattern_data.build);
+    let _ = write_attestation_bundle(output, input, &pattern_data);
     if !no_cache {
         let _ = update_cache(input, output);
     }
@@ -241,7 +259,12 @@ fn suggest_patterns(pattern: &Path, input: &Path, output: &Path) -> io::Result<(
     }
     let manifest = extract_manifest(&content);
     pattern_data.metadata.version = "suggested".to_string();
-    let toml = render_toml(&pattern_data.metadata, &pattern_data.build, &pattern_data.mapping, &manifest);
+    let toml = render_toml(
+        &pattern_data.metadata,
+        &pattern_data.build,
+        &pattern_data.mapping,
+        &manifest,
+    );
     fs::write(output, toml.as_bytes())?;
     Ok(())
 }
@@ -335,8 +358,7 @@ fn is_ident_continue(b: u8) -> bool {
 fn is_keyword(name: &str) -> bool {
     matches!(
         name,
-        "if"
-            | "for"
+        "if" | "for"
             | "while"
             | "match"
             | "return"
@@ -391,26 +413,7 @@ fn thin_lto_pass(source: &str) -> String {
 
 fn sign_output(output: &Path) -> io::Result<()> {
     let content = fs::read(output)?;
-    let issued = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let key_id = env::var("IRONPORT_KEY_ID").unwrap_or_else(|_| "local-key-1".to_string());
-    let prev_id = env::var("IRONPORT_PREV_KEY_ID").unwrap_or_else(|_| "none".to_string());
-    let expires = env::var("IRONPORT_KEY_EXPIRES")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or_else(|| issued.saturating_add(90 * 24 * 60 * 60));
-    let payload = build_signature_payload(&content, &key_id, &prev_id, issued, expires);
-    let (alg, sig_hex) = if let Ok(cmd) = env::var("IRONPORT_SIGN_CMD") {
-        let sig = run_sign_command(&cmd, &payload)?;
-        ("EXT", sig)
-    } else {
-        let key = load_signing_key()?;
-        let sig = hmac_sha256(&key, payload.as_bytes());
-        ("HMAC-SHA256", hex_encode(&sig))
-    };
-    let sig = format!("SIG2:{alg}:{key_id}:{prev_id}:{issued}:{expires}:{sig_hex}");
+    let sig = sign_blob(&content, "artifact")?;
     let mut sig_path = PathBuf::from(output);
     sig_path.set_extension("sig");
     fs::write(sig_path, sig.as_bytes())?;
@@ -540,10 +543,7 @@ fn audit_log(action: &str, output: &Path) {
     let base = PathBuf::from(".ironport");
     let _ = fs::create_dir_all(&base);
     let log_path = base.join("audit.log");
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let timestamp = current_epoch();
     let line = format!("{timestamp} {action} {}\n", output.display());
     let _ = fs::OpenOptions::new()
         .create(true)
@@ -580,11 +580,7 @@ fn incremental_cache_hit(transformed: &str, output: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
-fn update_incremental_cache(
-    transformed: &str,
-    output: &Path,
-    enabled: bool,
-) -> io::Result<()> {
+fn update_incremental_cache(transformed: &str, output: &Path, enabled: bool) -> io::Result<()> {
     if !enabled {
         return Ok(());
     }
@@ -632,83 +628,18 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn decode_hex(input: &str) -> io::Result<Vec<u8>> {
-    let bytes = input.as_bytes();
-    if bytes.len() % 2 != 0 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "hex length"));
-    }
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    let mut i = 0;
-    while i < bytes.len() {
-        let hi = hex_value(bytes[i])?;
-        let lo = hex_value(bytes[i + 1])?;
-        out.push((hi << 4) | lo);
-        i += 2;
-    }
-    Ok(out)
-}
-
-fn hex_value(b: u8) -> io::Result<u8> {
-    match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "hex char")),
-    }
-}
-
-fn load_signing_key() -> io::Result<Vec<u8>> {
-    if let Ok(hex) = env::var("IRONPORT_SIGNING_KEY_HEX") {
-        return decode_hex(hex.trim());
-    }
-    if let Ok(raw) = env::var("IRONPORT_SIGNING_KEY") {
-        return Ok(raw.into_bytes());
-    }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "missing signing key",
-    ))
-}
-
-fn build_signature_payload(
-    content: &[u8],
-    key_id: &str,
-    prev_id: &str,
-    issued: u64,
-    expires: u64,
-) -> String {
-    let hash = hash_bytes(content);
-    format!(
-        "v=2\nhash={hash}\nkey_id={key_id}\nprev_id={prev_id}\nissued={issued}\nexpires={expires}\n"
-    )
-}
-
-fn run_sign_command(cmd: &str, payload: &str) -> io::Result<String> {
-    let mut parts = cmd.split_whitespace();
-    let program = parts.next().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "sign cmd"))?;
-    let mut command = Command::new(program);
-    for arg in parts {
-        command.arg(arg);
-    }
-    let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(payload.as_bytes())?;
-    }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(io::Error::new(io::ErrorKind::Other, "sign command failed"));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
 fn run_external_lto(cmd: &str, input: &Path, output: &Path) -> io::Result<()> {
     let mut parts = cmd.split_whitespace();
-    let program = parts.next().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "lto cmd"))?;
+    let program = parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "lto cmd"))?;
     let input_str = input.to_string_lossy();
     let output_str = output.to_string_lossy();
     let mut command = Command::new(program);
     for arg in parts {
-        let arg = arg.replace("{input}", &input_str).replace("{output}", &output_str);
+        let arg = arg
+            .replace("{input}", &input_str)
+            .replace("{output}", &output_str);
         command.arg(arg);
     }
     let status = command.status()?;
@@ -718,16 +649,94 @@ fn run_external_lto(cmd: &str, input: &Path, output: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn write_attestation_bundle(
+    output: &Path,
+    input: &Path,
+    pattern_data: &PatternData,
+) -> io::Result<()> {
+    let artifact = fs::read(output)?;
+    let artifact_hash = shared_hash_bytes(&artifact);
+    let input_hash = file_hash(input)?;
+    let output_name = output
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("artifact");
+    let issued = current_epoch();
+
+    let intoto = format!(
+        concat!(
+            "{{\n",
+            "  \"_type\": \"https://in-toto.io/Statement/v1\",\n",
+            "  \"subject\": [{{\"name\": \"{}\", \"digest\": {{\"sha256\": \"{}\"}}}}],\n",
+            "  \"predicateType\": \"https://slsa.dev/provenance/v1\",\n",
+            "  \"predicate\": {{\n",
+            "    \"buildType\": \"https://ironshim.dev/ironport/apply/v1\",\n",
+            "    \"builder\": {{\"id\": \"ironport\"}},\n",
+            "    \"invocation\": {{\"source_sha256\": \"{}\", \"linux_version\": \"{}\", \"driver_family\": \"{}\"}}\n",
+            "  }}\n",
+            "}}\n"
+        ),
+        json_escape(output_name),
+        artifact_hash,
+        input_hash,
+        json_escape(&pattern_data.metadata.linux_version),
+        json_escape(&pattern_data.metadata.driver_family),
+    );
+
+    let slsa = format!(
+        concat!(
+            "{{\n",
+            "  \"subject_name\": \"{}\",\n",
+            "  \"subject_sha256\": \"{}\",\n",
+            "  \"build_type\": \"https://ironshim.dev/ironport/apply/v1\",\n",
+            "  \"builder_id\": \"ironport\",\n",
+            "  \"build_started_on\": {},\n",
+            "  \"thin_lto\": {},\n",
+            "  \"incremental\": {}\n",
+            "}}\n"
+        ),
+        json_escape(output_name),
+        artifact_hash,
+        issued,
+        pattern_data.build.thin_lto,
+        pattern_data.build.incremental,
+    );
+
+    let spdx = format!(
+        concat!(
+            "{{\n",
+            "  \"spdxVersion\": \"SPDX-3.0.1\",\n",
+            "  \"dataLicense\": \"CC0-1.0\",\n",
+            "  \"documentName\": \"{}\",\n",
+            "  \"subject_sha256\": \"{}\",\n",
+            "  \"packages\": [{{\"name\": \"{}\", \"versionInfo\": \"{}\", \"supplier\": \"Organization: ironport\"}}]\n",
+            "}}\n"
+        ),
+        json_escape(output_name),
+        artifact_hash,
+        json_escape(output_name),
+        json_escape(&pattern_data.metadata.version),
+    );
+
+    fs::write(intoto_path(output), intoto.as_bytes())?;
+    fs::write(slsa_path(output), slsa.as_bytes())?;
+    fs::write(spdx_path(output), spdx.as_bytes())?;
+    Ok(())
+}
+
 fn write_output_provenance(output: &Path, input: &Path, build: &BuildSettings) -> io::Result<()> {
     let mut prov_path = PathBuf::from(output);
     prov_path.set_extension("prov");
     let input_hash = file_hash(input)?;
     let build_hash = file_hash(output)?;
     let toolchain = format!("{}-{}", env::consts::OS, env::consts::ARCH);
+    let issued = current_epoch();
     let mut out = String::new();
     let _ = writeln!(&mut out, "source_hash={input_hash}");
     let _ = writeln!(&mut out, "build_hash={build_hash}");
     let _ = writeln!(&mut out, "toolchain={toolchain}");
+    let _ = writeln!(&mut out, "subject_sha256={build_hash}");
+    let _ = writeln!(&mut out, "source_date_epoch={issued}");
     let _ = writeln!(&mut out, "thin_lto={}", build.thin_lto);
     let _ = writeln!(&mut out, "incremental={}", build.incremental);
     fs::write(prov_path, out.as_bytes())?;

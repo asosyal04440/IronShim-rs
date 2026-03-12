@@ -1,23 +1,24 @@
-use std::collections::{HashMap, HashSet};
+#[path = "shared/tooling_support.rs"]
+mod tooling_support;
+
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
-use ironshim_rs::crypto::{hmac_sha256, Sha256};
+
+use tooling_support::{
+    hash_bytes, intoto_path, load_revoked, load_trusted, slsa_path, spdx_path, verify_signature,
+};
 
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() {
-        eprintln!("ironport-client <addr> index");
-        eprintln!("ironport-client <addr> get <name> <out>");
-        eprintln!("ironport-client <addr> get-verified <name> <out>");
+        usage();
         return;
     }
     if args.len() == 2 && args[1] == "index" {
-        if let Ok(body) = request(&args[0], "/index") {
+        if let Ok((_, body)) = request(&args[0], "/index") {
             println!("{body}");
         }
         return;
@@ -25,288 +26,295 @@ fn main() {
     if args.len() == 4 && args[1] == "get" {
         let name = &args[2];
         let out = PathBuf::from(&args[3]);
-        if let Ok(body) = request(&args[0], &format!("/file/{name}")) {
-            let _ = fs::write(out, body.as_bytes());
+        if let Ok((status, body)) = request(&args[0], &format!("/file/{name}")) {
+            if status == 200 {
+                let _ = fs::write(out, body.as_bytes());
+            }
         }
         return;
     }
     if args.len() == 4 && args[1] == "get-verified" {
         let name = &args[2];
         let out = PathBuf::from(&args[3]);
-        if let Ok(body) = request(&args[0], &format!("/file/{name}")) {
-            if let Ok(sig) = request(&args[0], &format!("/file/{name}.sig")) {
-                if let Ok(prov) = request(&args[0], &format!("/file/{name}.prov")) {
-                    let revoked = load_revoked(Path::new("revoked.keys"));
-                    let trusted = load_trusted(Path::new("trusted.keys"));
-                    if verify_signature(&sig, body.as_bytes(), &revoked, &trusted)
-                        && verify_provenance(&prov, body.as_bytes())
-                    {
-                        let _ = fs::write(out, body.as_bytes());
-                    } else {
-                        eprintln!("verification failed");
-                    }
-                }
+        match fetch_verified(&args[0], name, &out) {
+            Ok(()) => {}
+            Err(err) => {
+                eprintln!("verification failed: {err}");
+                std::process::exit(1);
             }
         }
         return;
     }
+    usage();
+}
+
+fn usage() {
     eprintln!("ironport-client <addr> index");
     eprintln!("ironport-client <addr> get <name> <out>");
     eprintln!("ironport-client <addr> get-verified <name> <out>");
 }
 
-fn request(addr: &str, path: &str) -> std::io::Result<String> {
+fn fetch_verified(addr: &str, name: &str, out: &Path) -> std::io::Result<()> {
+    let revoked = load_revoked(Path::new("revoked.keys"));
+    let trusted = load_trusted(Path::new("trusted.keys"));
+
+    let root = fetch_metadata(addr, "root.json", &revoked, &trusted, "tuf-root")?;
+    let targets = fetch_metadata(addr, "targets.json", &revoked, &trusted, "tuf-targets")?;
+    let snapshot = fetch_metadata(addr, "snapshot.json", &revoked, &trusted, "tuf-snapshot")?;
+    let timestamp = fetch_metadata(addr, "timestamp.json", &revoked, &trusted, "tuf-timestamp")?;
+
+    verify_snapshot_chain(&root, &targets, &snapshot, &timestamp)?;
+    update_rollback_state(addr, &snapshot, &timestamp)?;
+
+    let (status, body) = request(addr, &format!("/file/{name}"))?;
+    if status != 200 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "artifact not found",
+        ));
+    }
+    let artifact = body.into_bytes();
+    let artifact_hash = hash_bytes(&artifact);
+    let (_, sig) = request(addr, &format!("/file/{name}.sig"))?;
+    if !verify_signature(&sig, &artifact, &revoked, &trusted, "artifact") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "artifact signature",
+        ));
+    }
+    verify_targets_entry(&targets, name, &artifact_hash, artifact.len() as u64)?;
+
+    let (_, prov) = request(addr, &format!("/file/{name}.prov"))?;
+    if parse_value(&prov, "build_hash").as_deref() != Some(artifact_hash.as_str()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "provenance hash",
+        ));
+    }
+
+    let intoto_name = with_extension(name, "intoto.json");
+    let slsa_name = with_extension(name, "slsa.json");
+    let spdx_name = with_extension(name, "spdx.json");
+    let (_, intoto) = request(addr, &format!("/file/{intoto_name}"))?;
+    let (_, slsa) = request(addr, &format!("/file/{slsa_name}"))?;
+    let (_, spdx) = request(addr, &format!("/file/{spdx_name}"))?;
+
+    if !intoto.contains(&format!("\"sha256\": \"{artifact_hash}\"")) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "in-toto subject",
+        ));
+    }
+    if parse_json_field(&slsa, "subject_sha256").as_deref() != Some(artifact_hash.as_str()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "slsa subject",
+        ));
+    }
+    if parse_json_field(&spdx, "subject_sha256").as_deref() != Some(artifact_hash.as_str()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "spdx subject",
+        ));
+    }
+
+    fs::write(out, &artifact)?;
+    fs::write(intoto_path(out), intoto.as_bytes())?;
+    fs::write(slsa_path(out), slsa.as_bytes())?;
+    fs::write(spdx_path(out), spdx.as_bytes())?;
+    Ok(())
+}
+
+fn fetch_metadata(
+    addr: &str,
+    name: &str,
+    revoked: &std::collections::HashSet<String>,
+    trusted: &std::collections::HashMap<String, tooling_support::TrustedKey>,
+    context: &str,
+) -> std::io::Result<String> {
+    let (status, body) = request(addr, &format!("/metadata/{name}"))?;
+    if status != 200 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "metadata missing",
+        ));
+    }
+    let (_, sig) = request(addr, &format!("/metadata/{name}.sig"))?;
+    if !verify_signature(&sig, body.as_bytes(), revoked, trusted, context) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "metadata signature",
+        ));
+    }
+    Ok(body)
+}
+
+fn verify_snapshot_chain(
+    root: &str,
+    targets: &str,
+    snapshot: &str,
+    timestamp: &str,
+) -> std::io::Result<()> {
+    let root_hash = hash_bytes(root.as_bytes());
+    let targets_hash = hash_bytes(targets.as_bytes());
+    let snapshot_hash = hash_bytes(snapshot.as_bytes());
+
+    if parse_meta_hash(snapshot, "root.json").as_deref() != Some(root_hash.as_str()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "snapshot root hash",
+        ));
+    }
+    if parse_meta_hash(snapshot, "targets.json").as_deref() != Some(targets_hash.as_str()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "snapshot targets hash",
+        ));
+    }
+    if parse_json_field(timestamp, "sha256").as_deref() != Some(snapshot_hash.as_str()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "timestamp snapshot hash",
+        ));
+    }
+    let now = tooling_support::current_epoch();
+    for body in [root, targets, snapshot, timestamp] {
+        let Some(expires) = parse_json_u64(body, "expires") else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "metadata expiry",
+            ));
+        };
+        if expires < now {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "metadata expired",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_targets_entry(
+    targets: &str,
+    name: &str,
+    artifact_hash: &str,
+    length: u64,
+) -> std::io::Result<()> {
+    let marker = format!("\"{name}\": {{");
+    let start = targets.find(&marker).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, "target missing")
+    })?;
+    let body = &targets[start..];
+    let recorded_hash = parse_json_field(body, "sha256").ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, "target hash missing")
+    })?;
+    let recorded_len = parse_json_u64(body, "length").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "target length missing",
+        )
+    })?;
+    if recorded_hash != artifact_hash || recorded_len != length {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "target mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn update_rollback_state(addr: &str, snapshot: &str, timestamp: &str) -> std::io::Result<()> {
+    let state_dir = PathBuf::from(".ironport-client");
+    fs::create_dir_all(&state_dir)?;
+    let state_path = state_dir.join(format!("{}.state", sanitize(addr)));
+    let snapshot_version = parse_json_u64(snapshot, "version").unwrap_or(0);
+    let timestamp_version = parse_json_u64(timestamp, "version").unwrap_or(0);
+    if state_path.exists() {
+        let content = fs::read_to_string(&state_path)?;
+        let old_snapshot = parse_value(&content, "snapshot_version")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let old_timestamp = parse_value(&content, "timestamp_version")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        if snapshot_version < old_snapshot || timestamp_version < old_timestamp {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "rollback detected",
+            ));
+        }
+    }
+    let state =
+        format!("snapshot_version={snapshot_version}\ntimestamp_version={timestamp_version}\n");
+    fs::write(state_path, state.as_bytes())?;
+    Ok(())
+}
+
+fn sanitize(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect()
+}
+
+fn with_extension(name: &str, extension: &str) -> String {
+    let mut path = PathBuf::from(name);
+    path.set_extension(extension);
+    path.to_string_lossy().to_string()
+}
+
+fn request(addr: &str, path: &str) -> std::io::Result<(u16, String)> {
     let mut stream = TcpStream::connect(addr)?;
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n\r\n");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes())?;
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
-    if let Some((_, body)) = response.split_once("\r\n\r\n") {
-        Ok(body.to_string())
-    } else {
-        Ok(String::new())
-    }
+    let mut lines = response.lines();
+    let status_line = lines.next().unwrap_or("");
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(0);
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default();
+    Ok((status, body))
 }
 
-fn verify_signature(
-    sig: &str,
-    content: &[u8],
-    revoked: &HashSet<String>,
-    trusted: &HashMap<String, TrustedKey>,
-) -> bool {
-    let record = match parse_signature(sig) {
-        Some(record) => record,
-        None => return false,
-    };
-    if revoked.contains(&record.key_id) {
-        return false;
-    }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    if record.issued > now || record.expires < now {
-        return false;
-    }
-    if !validate_chain(&record.key_id, trusted, revoked, now) {
-        return false;
-    }
-    let payload = build_signature_payload(content, &record.key_id, &record.prev_id, record.issued, record.expires);
-    match record.alg.as_str() {
-        "HMAC-SHA256" => {
-            let Some(key) = trusted.get(&record.key_id) else {
-                return false;
-            };
-            let sig = hmac_sha256(&key.key, payload.as_bytes());
-            hex_encode(&sig) == record.sig_hex
-        }
-        "EXT" => {
-            if let Ok(cmd) = env::var("IRONPORT_VERIFY_CMD") {
-                run_verify_command(&cmd, &payload, &record.sig_hex)
-            } else {
-                false
-            }
-        }
-        _ => false,
-    }
-}
-
-fn verify_provenance(prov: &str, content: &[u8]) -> bool {
-    if let Some(build_hash) = parse_provenance_value(prov, "build_hash") {
-        return build_hash == hash_bytes(content);
-    }
-    false
-}
-
-fn parse_provenance_value(content: &str, key: &str) -> Option<String> {
+fn parse_value(content: &str, key: &str) -> Option<String> {
     for line in content.lines() {
-        if let Some((k, v)) = line.split_once('=') {
-            if k.trim() == key {
-                return Some(v.trim().to_string());
+        if let Some((left, right)) = line.split_once('=') {
+            if left.trim() == key {
+                return Some(right.trim().to_string());
             }
         }
     }
     None
 }
 
-fn load_revoked(path: &Path) -> HashSet<String> {
-    let mut set = HashSet::new();
-    if let Ok(content) = fs::read_to_string(path) {
-        for line in content.lines() {
-            let key = line.trim();
-            if !key.is_empty() {
-                set.insert(key.to_string());
-            }
-        }
-    }
-    set
+fn parse_json_field(content: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\": \"");
+    let start = content.find(&needle)? + needle.len();
+    let rest = &content[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
-fn load_trusted(path: &Path) -> HashMap<String, TrustedKey> {
-    let mut map = HashMap::new();
-    if let Ok(content) = fs::read_to_string(path) {
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let parts: Vec<&str> = line.split(':').collect();
-            if parts.len() < 2 {
-                continue;
-            }
-            let key_id = parts[0].to_string();
-            let key = match decode_hex(parts[1]) {
-                Ok(key) => key,
-                Err(_) => continue,
-            };
-            let prev_id = parts.get(2).map(|v| v.to_string());
-            let expires_at = parts.get(3).and_then(|v| v.parse::<u64>().ok());
-            map.insert(
-                key_id.clone(),
-                TrustedKey {
-                    key_id,
-                    key,
-                    prev_id,
-                    expires_at,
-                },
-            );
-        }
-    }
-    map
+fn parse_json_u64(content: &str, key: &str) -> Option<u64> {
+    let needle = format!("\"{key}\": ");
+    let start = content.find(&needle)? + needle.len();
+    let rest = &content[start..];
+    let end = rest
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
-fn hash_bytes(content: &[u8]) -> String {
-    let digest = Sha256::digest(content);
-    hex_encode(&digest)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const LUT: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(LUT[(b >> 4) as usize] as char);
-        out.push(LUT[(b & 0x0f) as usize] as char);
-    }
-    out
-}
-
-fn decode_hex(input: &str) -> Result<Vec<u8>, ()> {
-    let bytes = input.as_bytes();
-    if bytes.len() % 2 != 0 {
-        return Err(());
-    }
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    let mut i = 0;
-    while i < bytes.len() {
-        let hi = hex_value(bytes[i])?;
-        let lo = hex_value(bytes[i + 1])?;
-        out.push((hi << 4) | lo);
-        i += 2;
-    }
-    Ok(out)
-}
-
-fn hex_value(b: u8) -> Result<u8, ()> {
-    match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => Err(()),
-    }
-}
-
-struct SignatureRecord {
-    alg: String,
-    key_id: String,
-    prev_id: String,
-    issued: u64,
-    expires: u64,
-    sig_hex: String,
-}
-
-struct TrustedKey {
-    key_id: String,
-    key: Vec<u8>,
-    prev_id: Option<String>,
-    expires_at: Option<u64>,
-}
-
-fn parse_signature(sig: &str) -> Option<SignatureRecord> {
-    let parts: Vec<&str> = sig.trim().split(':').collect();
-    if parts.len() != 7 || parts[0] != "SIG2" {
-        return None;
-    }
-    Some(SignatureRecord {
-        alg: parts[1].to_string(),
-        key_id: parts[2].to_string(),
-        prev_id: parts[3].to_string(),
-        issued: parts[4].parse().ok()?,
-        expires: parts[5].parse().ok()?,
-        sig_hex: parts[6].to_string(),
-    })
-}
-
-fn build_signature_payload(
-    content: &[u8],
-    key_id: &str,
-    prev_id: &str,
-    issued: u64,
-    expires: u64,
-) -> String {
-    let hash = hash_bytes(content);
-    format!(
-        "v=2\nhash={hash}\nkey_id={key_id}\nprev_id={prev_id}\nissued={issued}\nexpires={expires}\n"
-    )
-}
-
-fn validate_chain<'a>(
-    mut key_id: &'a str,
-    trusted: &'a HashMap<String, TrustedKey>,
-    revoked: &HashSet<String>,
-    now: u64,
-) -> bool {
-    for _ in 0..8 {
-        let Some(key) = trusted.get(key_id) else {
-            return false;
-        };
-        if revoked.contains(&key.key_id) {
-            return false;
-        }
-        if let Some(expires) = key.expires_at {
-            if expires < now {
-                return false;
-            }
-        }
-        let prev = match key.prev_id.as_deref() {
-            Some("none") | Some("") | None => return true,
-            Some(prev) => prev,
-        };
-        key_id = prev;
-    }
-    false
-}
-
-fn run_verify_command(cmd: &str, payload: &str, sig_hex: &str) -> bool {
-    let mut parts = cmd.split_whitespace();
-    let Some(program) = parts.next() else {
-        return false;
-    };
-    let mut command = Command::new(program);
-    for arg in parts {
-        let arg = arg.replace("{sig}", sig_hex);
-        command.arg(arg);
-    }
-    let mut child = match command.stdin(Stdio::piped()).stdout(Stdio::null()).spawn() {
-        Ok(child) => child,
-        Err(_) => return false,
-    };
-    if let Some(stdin) = child.stdin.as_mut() {
-        if stdin.write_all(payload.as_bytes()).is_err() {
-            return false;
-        }
-    }
-    match child.wait() {
-        Ok(status) => status.success(),
-        Err(_) => false,
-    }
+fn parse_meta_hash(content: &str, name: &str) -> Option<String> {
+    let marker = format!("\"{name}\": {{");
+    let start = content.find(&marker)?;
+    parse_json_field(&content[start..], "sha256")
 }

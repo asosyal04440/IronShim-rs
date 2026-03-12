@@ -21,7 +21,20 @@ impl InterruptBudget {
 pub struct InterruptMetrics {
     pub latency_ticks: u32,
     pub missed: u32,
+    pub irq_calls: u32,
+    pub deferred_runs: u32,
+    pub dma_map_ops: u32,
+    pub dma_unmap_ops: u32,
     pub budget_violations: u32,
+    pub quarantine_reason: Option<QuarantineReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuarantineReason {
+    BudgetExceeded,
+    HandlerFault,
+    TimeoutFault,
+    ContainmentEvent,
 }
 
 pub trait InterruptHandler {
@@ -56,6 +69,7 @@ pub struct WorkQueue<'a, const N: usize> {
     head: usize,
     tail: usize,
     len: usize,
+    runs: u32,
 }
 
 impl<'a, const N: usize> WorkQueue<'a, N> {
@@ -65,6 +79,7 @@ impl<'a, const N: usize> WorkQueue<'a, N> {
             head: 0,
             tail: 0,
             len: 0,
+            runs: 0,
         }
     }
 
@@ -90,7 +105,10 @@ impl<'a, const N: usize> WorkQueue<'a, N> {
         self.head = (self.head + 1) % N;
         self.len -= 1;
         if let Some(mut work) = item {
+            // SAFETY: `work` originates from a live mutable reference provided to `enqueue`; the
+            // queue never duplicates entries and removes the pointer before invoking `run`.
             unsafe { work.as_mut().run() };
+            self.runs = self.runs.saturating_add(1);
             Ok(())
         } else {
             Err(Error::ResourceNotGranted)
@@ -105,5 +123,9 @@ impl<'a, const N: usize> WorkQueue<'a, N> {
             }
         }
         processed
+    }
+
+    pub fn runs(&self) -> u32 {
+        self.runs
     }
 }

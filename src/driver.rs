@@ -89,29 +89,77 @@ pub struct DriverContext<
     pub lifecycle: &'a DriverLifecycle,
 }
 
+pub struct NoopLifecycleHooks;
+
+impl NoopLifecycleHooks {
+    pub fn start<A, R, T, U, S>(_ctx: &DriverContext<A, R, T, U, S>) -> Result<(), Error>
+    where
+        A: DmaAllocator,
+        R: InterruptRegistry,
+        T: TelemetrySink,
+        U: AuditSink,
+        S: SyscallPolicy,
+    {
+        Ok(())
+    }
+
+    pub fn suspend<A, R, T, U, S>(_ctx: &DriverContext<A, R, T, U, S>) -> Result<(), Error>
+    where
+        A: DmaAllocator,
+        R: InterruptRegistry,
+        T: TelemetrySink,
+        U: AuditSink,
+        S: SyscallPolicy,
+    {
+        Ok(())
+    }
+
+    pub fn resume<A, R, T, U, S>(_ctx: &DriverContext<A, R, T, U, S>) -> Result<(), Error>
+    where
+        A: DmaAllocator,
+        R: InterruptRegistry,
+        T: TelemetrySink,
+        U: AuditSink,
+        S: SyscallPolicy,
+    {
+        Ok(())
+    }
+}
+
+pub struct NoopInterruptHook;
+
+impl NoopInterruptHook {
+    pub fn handle<A, R, T, U, S>(
+        _irq: u32,
+        _ctx: &DriverContext<A, R, T, U, S>,
+    ) -> Result<(), Error>
+    where
+        A: DmaAllocator,
+        R: InterruptRegistry,
+        T: TelemetrySink,
+        U: AuditSink,
+        S: SyscallPolicy,
+    {
+        Ok(())
+    }
+}
+
 pub trait Driver<
     A: DmaAllocator,
     R: InterruptRegistry,
     T: TelemetrySink,
     U: AuditSink,
     S: SyscallPolicy,
-> {
+>
+{
     fn init(&mut self, ctx: &DriverContext<A, R, T, U, S>) -> Result<(), Error>;
-    fn start(&mut self, _ctx: &DriverContext<A, R, T, U, S>) -> Result<(), Error> {
-        Ok(())
-    }
-    fn suspend(&mut self, _ctx: &DriverContext<A, R, T, U, S>) -> Result<(), Error> {
-        Ok(())
-    }
-    fn resume(&mut self, _ctx: &DriverContext<A, R, T, U, S>) -> Result<(), Error> {
-        Ok(())
-    }
+    fn start(&mut self, ctx: &DriverContext<A, R, T, U, S>) -> Result<(), Error>;
+    fn suspend(&mut self, ctx: &DriverContext<A, R, T, U, S>) -> Result<(), Error>;
+    fn resume(&mut self, ctx: &DriverContext<A, R, T, U, S>) -> Result<(), Error>;
     fn shutdown(&mut self, ctx: &DriverContext<A, R, T, U, S>);
     fn handle_interrupt(
         &mut self,
-        _irq: u32,
-        _ctx: &DriverContext<A, R, T, U, S>,
-    ) -> Result<(), Error> {
-        Ok(())
-    }
+        irq: u32,
+        ctx: &DriverContext<A, R, T, U, S>,
+    ) -> Result<(), Error>;
 }

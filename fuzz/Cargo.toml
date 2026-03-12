@@ -1,0 +1,26 @@
+[package]
+name = "ironshim-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ironshim-rs = { path = "..", features = ["std", "fuzzing"] }
+
+[[bin]]
+name = "manifest_blob"
+path = "fuzz_targets/manifest_blob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pci_blob"
+path = "fuzz_targets/pci_blob.rs"
+test = false
+doc = false
+bench = false

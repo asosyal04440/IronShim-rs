@@ -1,0 +1,39 @@
+name: Advanced Verification
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"
+
+jobs:
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: Miri
+        run: cargo miri test --features "std alloc"
+      - name: Linux Host API Check
+        run: cargo check --tests --target x86_64-unknown-linux-gnu --features "std alloc linux-host"
+
+  fuzz-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install --locked cargo-fuzz
+      - name: Build fuzz targets
+        run: cargo fuzz build
+
+  kani:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Kani
+        run: cargo install --locked kani-verifier
+      - name: Run Kani proofs
+        run: cargo kani --features "std alloc kani"

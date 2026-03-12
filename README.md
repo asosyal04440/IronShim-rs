@@ -1,68 +1,91 @@
 # IronShim-rs
 
-IronShim-rs is a `no_std` Rust micro-shim isolation layer for untrusted drivers, designed for bare-metal operating systems. It enforces capability-based DMA/MMIO/Port I/O access, audited lifecycle control, and versioned ABI boundaries without leaking raw pointers into driver code.
+IronShim-rs is a hardening-first `no_std` Rust micro-shim for untrusted drivers. It is built for bare-metal operating systems that want explicit capability boundaries, deterministic lifecycle control, signed resource manifests, and a host-side validation lane for real PCIe hardware.
 
 ![no_std](https://img.shields.io/badge/no__std-yes-blue)
 ![Rust 2021](https://img.shields.io/badge/rust-2021-orange)
-![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)
+![License](https://img.shields.io/badge/license-AGPL--3.0--only-green)
 
-**Languages**
-- [English Documentation](docs/README.en.md)
-- [Türkçe Dokümantasyon](docs/README.tr.md)
+**Language Hubs**
+- [English Docs](docs/README.en.md)
+- [Turkce Dokumantasyon](docs/README.tr.md)
 
-## Highlights
+## Why This Exists
 
-- Capability-bound DMA/MMIO/Port I/O access with per-driver tagging.
-- Budgeted interrupt isolation and quarantine on overuse.
-- Signed manifest validation with revocation and key rotation hooks.
-- ABI versioning and compatibility checks for bindgen layouts.
-- Kernel-agnostic PCI discovery and topology interfaces.
-- Bare-metal friendly syscall policy hook with audit reporting.
+Most driver interfaces are still built around trust, ambient authority, and huge amounts of implied kernel behavior. IronShim-rs takes the opposite position:
 
-## What’s Inside
+- hardware access is granted explicitly
+- manifests are scoped to a concrete driver identity and IOMMU domain
+- interrupts are budgeted and can be quarantined
+- artifact delivery is signed, versioned, and rollback-aware
+- Linux can be used as a validation harness without collapsing the bare-metal model
 
-- `ironshim-rs` library: `no_std` isolation layer for drivers.
-- `ironport` tooling: user-space pipeline for pattern extraction, signing, and provenance.
-- `ironport-repo`/`ironport-client`: signed artifact repository and client.
+This crate is meant for teams that want a small isolation core, not a hand-wavy framework.
+
+## What You Get
+
+### Core Library
+
+- Fail-closed `ResourcePolicy` defaults for MMIO and Port I/O.
+- `ResourceManifest` with canonical serialization, SHA-256 hashing, signature hooks, revocation, and scope binding.
+- Typed DMA handles and scatter lists with manifest-bounded access.
+- Driver lifecycle state machine with explicit transitions and quarantine semantics.
+- Interrupt budgeting, deferred work queues, and telemetry/audit hooks.
+- ABI compatibility checks for version, features, and layout correctness.
+
+### Platform And Attestation Surface
+
+- Isolation descriptors for mapped DMA and shared virtual addressing.
+- Virtual-function budgeting and containment decisions for AER/DPC faults.
+- Device attestation and measured-boot data models for release gating.
+- Optional Linux host backend for DOE/SPDM, SR-IOV, AER/DPC, `iommufd`, and VFIO lab validation.
+
+### Tooling
+
+- `ironport` transformation and signing pipeline.
+- `ironport-repo` serving dynamic TUF-style metadata.
+- `ironport-client` verifying artifact signatures, provenance, subject hashes, and rollback state.
+- Kani proof harnesses, cargo-fuzz targets, and Miri automation.
+
+## Repository Map
+
+- `src/lib.rs`: public surface and feature gates
+- `src/resource.rs`: manifest model, policy, signatures, PCI parsing
+- `src/dma.rs`: DMA allocator traits, handles, constraints, scatter-gather
+- `src/driver.rs`: lifecycle and sandbox profile
+- `src/interrupt.rs`: IRQ budgets, quarantine, telemetry
+- `src/platform.rs`: isolation, attestation, measured boot, containment decisions
+- `src/linux_backend.rs`: Linux DOE/SPDM, SR-IOV, AER/DPC, `iommufd`, VFIO backend
+- `src/verification.rs`: Kani proofs
+- `src/bin/ironport.rs`: artifact transformation and signing
+- `src/bin/ironport_repo.rs`: repository service
+- `src/bin/ironport_client.rs`: verified download client
+- `fuzz/`: fuzz targets
+
+## Documentation Map
+
+- [Architecture Deep Dive](docs/ARCHITECTURE.md)
+- [Security Model](docs/SECURITY_MODEL.md)
+- [Operations Guide](docs/OPERATIONS.md)
+- [Artifact Chain](docs/ARTIFACT_CHAIN.md)
+- [Live Validation Guide](docs/LIVE_VALIDATION.md)
 
 ## Quick Start
+
+Library validation:
 
 ```bash
 cargo test
 ```
 
-## Status
+Full host-facing compile sweep:
 
-- Core isolation primitives are stable for bare-metal integration.
-- Kernel bindings and CI pipeline remain OS-specific.
-
-## Architecture at a Glance
-
-- **Driver Isolation**: `ResourceManifest` seals all hardware capabilities by `DriverTag`.
-- **DMA Safety**: translation is bounds-checked and validated before use.
-- **Interrupt Safety**: budgets prevent IRQ storms and quarantine offenders.
-- **Auditability**: manifest validation and syscall decisions are recorded.
-- **ABI Control**: explicit version/feature checks gate compatibility.
-
-## Architecture Diagram
-
-```mermaid
-flowchart LR
-    Driver[Untrusted Driver] --> Shim[IronShim]
-    Shim -->|Capabilities| HW[DMA/MMIO/Port I/O]
-    Shim -->|Budgets| IRQ[Interrupt Registry]
-    Shim -->|Policy| Sys[Syscall Gate]
-    Shim -->|Signed Manifest| Sig[Validator]
-    Sig --> Repo[Signed Artifact Repo]
+```bash
+cargo check --all-targets --all-features
+cargo check --tests --target x86_64-unknown-linux-gnu --features "std alloc linux-host"
 ```
 
-## Bare Metal Integration Status
-
-- Kernel PCI bridge/topology: ready for OS-specific binding.
-- Syscall policy: hook available, OS enforces allow/deny.
-- HSM/TPM signing: external signer/validator hook ready.
-
-## Example Flow
+Toolchain example:
 
 ```bash
 ironport extract linux.c ported.c v1 pattern.toml
@@ -71,20 +94,64 @@ ironport-repo 127.0.0.1:8080 repo_dir
 ironport-client 127.0.0.1:8080 get-verified output.c out.c
 ```
 
-## Threat Model Summary
+## Feature Matrix
 
-- Driver cannot access hardware outside manifest scope.
-- IRQ storms are bounded and quarantined.
-- Manifest tampering is blocked by signature checks and revocation.
+| Feature | Purpose |
+| --- | --- |
+| `std` | Enables host-side helpers and richer testing support |
+| `alloc` | Enables heap-backed structures used by host tooling and verification helpers |
+| `linux-host` | Enables Linux DOE/SPDM, SR-IOV, AER/DPC, `iommufd`, and VFIO backend |
+| `loom` | Concurrency-model exploration hooks |
+| `fuzzing` | Fuzz entry points for manifest and PCI parsing |
+| `kani` | Kani proof harnesses |
 
-## Roadmap
+## Security Snapshot
 
-- OS-specific PCI bridge implementation
-- CI workflows for clippy, fmt, miri, loom, fuzz
-- HSM/TPM-backed signing integration
+IronShim-rs assumes drivers are not trusted with raw hardware ownership.
 
-## Build and Test
+- MMIO and Port I/O are denied unless a policy grants access.
+- Manifest scope binds driver identity, IOMMU domain, and nonce.
+- Signature validation rejects revoked keys and hash mismatches.
+- Interrupt abuse is budgeted and can trigger quarantine.
+- AER/DPC faults are mapped into containment decisions.
+- Measured boot can block release when host trust is degraded.
+- Artifact distribution is provenance-aware and rollback-resistant.
 
-```bash
-cargo test
-```
+The longer version lives in [Security Model](docs/SECURITY_MODEL.md).
+
+## Linux Host Validation
+
+The `linux-host` feature is not a portability escape hatch. It is a lab lane for validating the same security model against real devices and kernel interfaces.
+
+It includes:
+
+- DOE mailbox access for SPDM
+- SPDM requester flows for version, capabilities, algorithms, certificate retrieval, challenge, measurements, key exchange, and finish
+- SR-IOV inventory and VF control through sysfs
+- AER counter ingestion and DPC containment/recovery helpers
+- `iommufd` IOAS and stage-1 page-table hooks
+- VFIO device binding and hardware page-table attach/detach
+
+Live execution instructions are documented in [Live Validation Guide](docs/LIVE_VALIDATION.md).
+
+## Verification Story
+
+This repo is built to support multiple confidence lanes instead of one giant "trust me" claim.
+
+- Unit tests cover isolation, manifests, ABI checks, attestation freshness, and interrupt behavior.
+- Kani proofs target manifest encoding, lifecycle constraints, DMA windows, containment mapping, and boot gating.
+- cargo-fuzz targets manifest and PCI parsing.
+- Miri is wired into CI for UB-sensitive paths.
+- GitHub Actions run the advanced verification lanes on a schedule.
+
+## Current Boundaries
+
+IronShim-rs is opinionated, but not magical.
+
+- Bare-metal integration still requires your kernel to implement allocator, IRQ, policy, and audit hooks.
+- Linux live validation still requires access to a Linux host with the relevant devices and kernel support.
+- Hardware certification is outside the scope of the crate itself.
+
+## License
+
+This project is licensed under the GNU Affero General Public License v3.0 only. See [LICENSE](LICENSE).

@@ -177,6 +177,8 @@ impl<'a, T, A: DmaAllocator> Deref for DmaHandle<'a, T, A> {
 
     /// Invariant: slice length equals allocation count; no out-of-bounds access.
     fn deref(&self) -> &Self::Target {
+        // SAFETY: `from_raw` validates the pointer/count pair and the handle owns that allocation
+        // for the lifetime of `self`.
         unsafe { slice::from_raw_parts(self.virt.as_ptr(), self.count) }
     }
 }
@@ -184,6 +186,8 @@ impl<'a, T, A: DmaAllocator> Deref for DmaHandle<'a, T, A> {
 impl<'a, T, A: DmaAllocator> DerefMut for DmaHandle<'a, T, A> {
     /// Invariant: slice length equals allocation count; no out-of-bounds access.
     fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: `from_raw` validates the pointer/count pair and `&mut self` guarantees unique
+        // access to the backing DMA allocation for this call.
         unsafe { slice::from_raw_parts_mut(self.virt.as_ptr(), self.count) }
     }
 }
@@ -192,6 +196,8 @@ impl<'a, T, A: DmaAllocator> Drop for DmaHandle<'a, T, A> {
     /// Invariant: frees only allocations produced by this allocator.
     fn drop(&mut self) {
         if self.zeroize_on_drop {
+            // SAFETY: `virt` points to `bytes()` writable bytes owned by this handle; zeroization
+            // happens before the allocator reclaims the buffer.
             unsafe {
                 core::ptr::write_bytes(self.virt.as_ptr() as *mut u8, 0, self.bytes());
             }
@@ -255,6 +261,8 @@ impl<'a, T, A: DmaAllocator, const N: usize> DmaScatterList<'a, T, A, N> {
         if index >= self.len {
             return None;
         }
+        // SAFETY: `index < len` guarantees the slot was initialized by `push` and has not been
+        // dropped yet because the scatter list still owns it.
         let handle = unsafe { self.entries[index].assume_init_ref() };
         Some(ScatterEntry {
             phys: handle.phys(),
@@ -267,6 +275,8 @@ impl<'a, T, A: DmaAllocator, const N: usize> Drop for DmaScatterList<'a, T, A, N
     /// Invariant: drops all owned handles, triggering allocator reclamation.
     fn drop(&mut self) {
         for index in 0..self.len {
+            // SAFETY: entries in `0..len` were initialized by `push`; each is dropped exactly once
+            // here when the scatter list releases ownership.
             unsafe { self.entries[index].assume_init_drop() };
         }
     }

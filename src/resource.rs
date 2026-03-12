@@ -1,6 +1,7 @@
 use core::marker::PhantomData;
 use core::ptr::{read_volatile, write_volatile};
 
+use crate::crypto::Sha256;
 use crate::{AuditEvent, AuditSink, Error, NotSendSync, TelemetryEvent, TelemetrySink};
 
 pub trait PortIo {
@@ -14,22 +15,18 @@ pub trait PortIo {
 
 pub trait ResourcePolicy {
     fn mmio_read(&self, _base: usize, _offset: usize, _size: usize) -> Result<(), Error> {
-        Ok(())
+        Err(Error::AccessDenied)
     }
     fn mmio_write(&self, _base: usize, _offset: usize, _size: usize) -> Result<(), Error> {
-        Ok(())
+        Err(Error::AccessDenied)
     }
     fn port_read(&self, _base: u16, _offset: u16, _size: u16) -> Result<(), Error> {
-        Ok(())
+        Err(Error::AccessDenied)
     }
     fn port_write(&self, _base: u16, _offset: u16, _size: u16) -> Result<(), Error> {
-        Ok(())
+        Err(Error::AccessDenied)
     }
 }
-
-pub struct AllowAllPolicy;
-
-impl ResourcePolicy for AllowAllPolicy {}
 
 #[derive(Debug, Clone, Copy)]
 pub struct MmioDesc {
@@ -41,6 +38,13 @@ pub struct MmioDesc {
 pub struct IoPortDesc {
     pub port: u16,
     pub count: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceScope {
+    pub driver_id: u64,
+    pub iommu_domain: u32,
+    pub binding_nonce: u32,
 }
 
 pub struct MmioRegion<DriverTag> {
@@ -58,6 +62,7 @@ pub struct IoPortRange<DriverTag> {
 }
 
 pub struct ResourceManifest<DriverTag, const MMIO: usize = 8, const PORTS: usize = 8> {
+    scope: ResourceScope,
     mmio: [MmioDesc; MMIO],
     mmio_len: usize,
     ports: [IoPortDesc; PORTS],
@@ -71,11 +76,15 @@ pub struct ResourceManifest<DriverTag, const MMIO: usize = 8, const PORTS: usize
 impl<DriverTag, const MMIO: usize, const PORTS: usize> ResourceManifest<DriverTag, MMIO, PORTS> {
     /// Invariant: all regions are non-empty and indices are within fixed capacity.
     pub fn new(
+        scope: ResourceScope,
         mmio: [MmioDesc; MMIO],
         mmio_len: usize,
         ports: [IoPortDesc; PORTS],
         ports_len: usize,
     ) -> Result<Self, Error> {
+        if scope.driver_id == 0 || scope.iommu_domain == 0 {
+            return Err(Error::InvalidState);
+        }
         if mmio_len > MMIO || ports_len > PORTS {
             return Err(Error::InvalidAddress);
         }
@@ -90,6 +99,7 @@ impl<DriverTag, const MMIO: usize, const PORTS: usize> ResourceManifest<DriverTa
             }
         }
         Ok(Self {
+            scope,
             mmio,
             mmio_len,
             ports,
@@ -99,6 +109,10 @@ impl<DriverTag, const MMIO: usize, const PORTS: usize> ResourceManifest<DriverTa
             _tag: PhantomData,
             _nosend: NotSendSync::new(),
         })
+    }
+
+    pub fn scope(&self) -> ResourceScope {
+        self.scope
     }
 
     /// Invariant: returned region is bounded to the manifest whitelist.
@@ -212,18 +226,14 @@ impl<DriverTag> MmioRegion<DriverTag> {
         if size == 0 || end > self.size {
             return Err(Error::OutOfBounds);
         }
-        self.base
-            .checked_add(offset)
-            .ok_or(Error::InvalidAddress)
+        self.base.checked_add(offset).ok_or(Error::InvalidAddress)
     }
 
-    pub fn read_u32<P: ResourcePolicy>(
-        &self,
-        policy: &P,
-        offset: usize,
-    ) -> Result<u32, Error> {
+    pub fn read_u32<P: ResourcePolicy>(&self, policy: &P, offset: usize) -> Result<u32, Error> {
         policy.mmio_read(self.base, offset, core::mem::size_of::<u32>())?;
         let addr = self.check(offset, core::mem::size_of::<u32>())?;
+        // SAFETY: `check` guarantees the address is within the granted MMIO window and aligned
+        // for a `u32` access as provided by the caller's manifest region contract.
         Ok(unsafe { read_volatile(addr as *const u32) })
     }
 
@@ -235,6 +245,8 @@ impl<DriverTag> MmioRegion<DriverTag> {
     ) -> Result<(), Error> {
         policy.mmio_write(self.base, offset, core::mem::size_of::<u32>())?;
         let addr = self.check(offset, core::mem::size_of::<u32>())?;
+        // SAFETY: `check` guarantees the address is within the granted MMIO window and points to
+        // writable MMIO that the manifest exposes for this driver.
         unsafe { write_volatile(addr as *mut u32, value) };
         Ok(())
     }
@@ -319,7 +331,9 @@ impl<DriverTag> IoPortRange<DriverTag> {
 pub struct ManifestSignature {
     pub key_id: u64,
     pub timestamp: u64,
-    pub hash: [u8; 32],
+    pub manifest_hash: [u8; 32],
+    pub provenance_hash: Option<[u8; 32]>,
+    pub device_attestation_hash: Option<[u8; 32]>,
 }
 
 pub trait ManifestValidator {
@@ -404,7 +418,11 @@ pub trait KernelPciBridge {
     fn topology(&self) -> &dyn PciTopology;
 }
 
-pub fn discover_pci_functions<A: PciConfigAccess + ?Sized, T: PciTopology + ?Sized, const N: usize>(
+pub fn discover_pci_functions<
+    A: PciConfigAccess + ?Sized,
+    T: PciTopology + ?Sized,
+    const N: usize,
+>(
     access: &A,
     topology: &T,
     out: &mut [PciFunctionDesc; N],
@@ -568,19 +586,62 @@ pub fn parse_pci_functions<A: PciConfigAccess, const N: usize>(
 }
 
 impl<DriverTag, const MMIO: usize, const PORTS: usize> ResourceManifest<DriverTag, MMIO, PORTS> {
-    pub fn compute_hash(&self) -> [u8; 32] {
-        let mut hash = [0u8; 32];
+    pub fn canonical_len(&self) -> usize {
+        8 + 4 + 4 + 2 + 2 + (self.mmio_len * 17) + (self.ports_len * 5)
+    }
+
+    pub fn write_canonical(&self, out: &mut [u8]) -> Result<usize, Error> {
+        if out.len() < self.canonical_len() {
+            return Err(Error::OutOfMemory);
+        }
+        let mut cursor = 0;
+        out[cursor..cursor + 8].copy_from_slice(&self.scope.driver_id.to_le_bytes());
+        cursor += 8;
+        out[cursor..cursor + 4].copy_from_slice(&self.scope.iommu_domain.to_le_bytes());
+        cursor += 4;
+        out[cursor..cursor + 4].copy_from_slice(&self.scope.binding_nonce.to_le_bytes());
+        cursor += 4;
+        out[cursor..cursor + 2].copy_from_slice(&(self.mmio_len as u16).to_le_bytes());
+        cursor += 2;
+        out[cursor..cursor + 2].copy_from_slice(&(self.ports_len as u16).to_le_bytes());
+        cursor += 2;
         for idx in 0..self.mmio_len {
-            mix_hash(&mut hash, self.mmio[idx].base as u64);
-            mix_hash(&mut hash, self.mmio[idx].size as u64);
-            mix_hash(&mut hash, self.mmio_revoked[idx] as u64);
+            out[cursor..cursor + 8].copy_from_slice(&(self.mmio[idx].base as u64).to_le_bytes());
+            cursor += 8;
+            out[cursor..cursor + 8].copy_from_slice(&(self.mmio[idx].size as u64).to_le_bytes());
+            cursor += 8;
+            out[cursor] = self.mmio_revoked[idx] as u8;
+            cursor += 1;
         }
         for idx in 0..self.ports_len {
-            mix_hash(&mut hash, self.ports[idx].port as u64);
-            mix_hash(&mut hash, self.ports[idx].count as u64);
-            mix_hash(&mut hash, self.ports_revoked[idx] as u64);
+            out[cursor..cursor + 2].copy_from_slice(&self.ports[idx].port.to_le_bytes());
+            cursor += 2;
+            out[cursor..cursor + 2].copy_from_slice(&self.ports[idx].count.to_le_bytes());
+            cursor += 2;
+            out[cursor] = self.ports_revoked[idx] as u8;
+            cursor += 1;
         }
-        hash
+        Ok(cursor)
+    }
+
+    pub fn compute_hash(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(&self.scope.driver_id.to_le_bytes());
+        hasher.update(&self.scope.iommu_domain.to_le_bytes());
+        hasher.update(&self.scope.binding_nonce.to_le_bytes());
+        hasher.update(&(self.mmio_len as u16).to_le_bytes());
+        hasher.update(&(self.ports_len as u16).to_le_bytes());
+        for idx in 0..self.mmio_len {
+            hasher.update(&(self.mmio[idx].base as u64).to_le_bytes());
+            hasher.update(&(self.mmio[idx].size as u64).to_le_bytes());
+            hasher.update(&[self.mmio_revoked[idx] as u8]);
+        }
+        for idx in 0..self.ports_len {
+            hasher.update(&self.ports[idx].port.to_le_bytes());
+            hasher.update(&self.ports[idx].count.to_le_bytes());
+            hasher.update(&[self.ports_revoked[idx] as u8]);
+        }
+        hasher.finalize()
     }
 
     pub fn validate_signature<V: ManifestValidator, R: RevocationList>(
@@ -593,7 +654,7 @@ impl<DriverTag, const MMIO: usize, const PORTS: usize> ResourceManifest<DriverTa
             return Err(Error::SignatureInvalid);
         }
         let expected = self.compute_hash();
-        if expected != signature.hash {
+        if expected != signature.manifest_hash {
             return Err(Error::SignatureInvalid);
         }
         validator.validate(signature)
@@ -618,7 +679,7 @@ impl<DriverTag, const MMIO: usize, const PORTS: usize> ResourceManifest<DriverTa
             return Err(Error::SignatureInvalid);
         }
         let expected = self.compute_hash();
-        if expected != signature.hash {
+        if expected != signature.manifest_hash {
             telemetry.record(TelemetryEvent::Error(Error::SignatureInvalid));
             audit.record(AuditEvent::ManifestRejected);
             return Err(Error::SignatureInvalid);
@@ -632,12 +693,17 @@ impl<DriverTag, const MMIO: usize, const PORTS: usize> ResourceManifest<DriverTa
 pub fn parse_manifest_blob<DriverTag, const MMIO: usize, const PORTS: usize>(
     bytes: &[u8],
 ) -> Result<ResourceManifest<DriverTag, MMIO, PORTS>, Error> {
-    if bytes.len() < 4 {
+    if bytes.len() < 24 || &bytes[..4] != b"ISM2" {
         return Err(Error::InvalidAddress);
     }
-    let mmio_len = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
-    let ports_len = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
-    let mut cursor = 4;
+    let driver_id = u64::from_le_bytes([
+        bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+    ]);
+    let iommu_domain = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    let binding_nonce = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let mmio_len = u16::from_le_bytes([bytes[20], bytes[21]]) as usize;
+    let ports_len = u16::from_le_bytes([bytes[22], bytes[23]]) as usize;
+    let mut cursor = 24;
     if mmio_len > MMIO || ports_len > PORTS {
         return Err(Error::InvalidAddress);
     }
@@ -679,13 +745,15 @@ pub fn parse_manifest_blob<DriverTag, const MMIO: usize, const PORTS: usize>(
         ports[idx] = IoPortDesc { port, count };
         cursor += 4;
     }
-    ResourceManifest::new(mmio, mmio_len, ports, ports_len)
-}
-
-fn mix_hash(hash: &mut [u8; 32], value: u64) {
-    let bytes = value.to_le_bytes();
-    for (i, b) in bytes.iter().enumerate() {
-        hash[i % 32] = hash[i % 32].wrapping_add(*b).rotate_left((i as u32) & 7);
-        hash[(i + 16) % 32] ^= b.rotate_left(3);
-    }
+    ResourceManifest::new(
+        ResourceScope {
+            driver_id,
+            iommu_domain,
+            binding_nonce,
+        },
+        mmio,
+        mmio_len,
+        ports,
+        ports_len,
+    )
 }

@@ -1,13 +1,16 @@
-use crate::mock::{MockDmaAllocator, MockInterruptRegistry};
+use crate::mock::{AllowAllPolicy, MockDmaAllocator, MockInterruptRegistry};
 use crate::{
+    containment_decision,
     crypto::{hmac_sha256, Sha256},
-    enforce_syscall, AuditEvent, AuditSink, AllowAllPolicy, AbiFeatures, AbiVersionRange,
-    DmaAllocator, DmaConstraints, DmaScatterList, DriverAbiDescriptor, Error, InterruptBudget,
-    InterruptHandler, InterruptRegistry, MmioDesc, ResourceManifest, ResourcePolicy,
-    SyscallPolicy, SyscallRequest,
+    enforce_syscall, AbiFeatures, AbiVersionRange, AerEvent, AerSeverity, AuditEvent, AuditSink,
+    BootTrust, ContainmentDecision, DeviceAttestationReport, DmaAllocator, DmaConstraints,
+    DmaScatterList, DriverAbiDescriptor, Error, InterruptBudget, InterruptHandler,
+    InterruptRegistry, IsolationBinding, IsolationMode, MeasuredBootRecord, MeasuredBootState,
+    MmioDesc, PciIsolationCaps, QuarantineReason, ResourceManifest, ResourcePolicy, ResourceScope,
+    SpdmMeasurement, SyscallPolicy, SyscallRequest,
 };
-use std::string::String;
 use std::boxed::Box;
+use std::string::String;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::vec;
 
@@ -26,6 +29,11 @@ fn patched_driver_unauthorized_mmio_is_blocked() {
     let mut mmio = vec![0u32; 4];
     let base = mmio.as_mut_ptr() as usize;
     let manifest = ResourceManifest::<DriverTag, 1, 0>::new(
+        ResourceScope {
+            driver_id: 1,
+            iommu_domain: 7,
+            binding_nonce: 9,
+        },
         [MmioDesc { base, size: 16 }],
         1,
         [],
@@ -86,7 +94,14 @@ fn interrupt_registry_triggers_handler() {
     let handler = Box::leak(Box::new(TestHandler));
 
     registry
-        .register_with_budget(3, handler, InterruptBudget { max_ticks: 10, max_calls: 2 })
+        .register_with_budget(
+            3,
+            handler,
+            InterruptBudget {
+                max_ticks: 10,
+                max_calls: 2,
+            },
+        )
         .unwrap();
     registry.trigger_with_budget(3, 1).unwrap();
     assert_eq!(SEEN.load(Ordering::SeqCst), 3);
@@ -97,10 +112,20 @@ fn interrupt_budget_quarantines_on_overuse() {
     let registry = MockInterruptRegistry::new(4);
     let handler = Box::leak(Box::new(TestHandler));
     registry
-        .register_with_budget(1, handler, InterruptBudget { max_ticks: 1, max_calls: 1 })
+        .register_with_budget(
+            1,
+            handler,
+            InterruptBudget {
+                max_ticks: 1,
+                max_calls: 1,
+            },
+        )
         .unwrap();
     assert!(registry.trigger_with_budget(1, 1).is_ok());
-    assert_eq!(registry.trigger_with_budget(1, 1), Err(Error::BudgetExceeded));
+    assert_eq!(
+        registry.trigger_with_budget(1, 1),
+        Err(Error::BudgetExceeded)
+    );
 }
 
 #[test]
@@ -108,6 +133,11 @@ fn mmio_access_with_allow_policy() {
     let mut mmio = vec![0u32; 4];
     let base = mmio.as_mut_ptr() as usize;
     let manifest = ResourceManifest::<DriverTag, 1, 0>::new(
+        ResourceScope {
+            driver_id: 7,
+            iommu_domain: 3,
+            binding_nonce: 11,
+        },
         [MmioDesc { base, size: 16 }],
         1,
         [],
@@ -118,6 +148,26 @@ fn mmio_access_with_allow_policy() {
     assert!(region.write_u32(&AllowAllPolicy, 0, 5).is_ok());
     let value = region.read_u32(&AllowAllPolicy, 0).unwrap();
     assert_eq!(value, 5);
+}
+
+#[test]
+fn mmio_access_is_fail_closed_by_default() {
+    let mut mmio = vec![0u32; 4];
+    let base = mmio.as_mut_ptr() as usize;
+    let manifest = ResourceManifest::<DriverTag, 1, 0>::new(
+        ResourceScope {
+            driver_id: 13,
+            iommu_domain: 2,
+            binding_nonce: 5,
+        },
+        [MmioDesc { base, size: 16 }],
+        1,
+        [],
+        0,
+    )
+    .unwrap();
+    let region = manifest.mmio_region(0).unwrap();
+    assert_eq!(region.read_u32(&DenyByDefault, 0), Err(Error::AccessDenied));
 }
 
 #[test]
@@ -134,7 +184,8 @@ fn abi_range_rejects_out_of_bounds() {
         struct_align: 8,
     };
     let range = AbiVersionRange { min: 1, max: 2 };
-    let result = crate::validate_driver_abi_compat::<TestAbi>(descriptor, range, AbiFeatures { bits: 0 });
+    let result =
+        crate::validate_driver_abi_compat::<TestAbi>(descriptor, range, AbiFeatures { bits: 0 });
     assert_eq!(result, Err(Error::InvalidState));
 }
 
@@ -216,10 +267,181 @@ fn syscall_policy_records_audit() {
     assert_eq!(audit.denied.load(Ordering::SeqCst), 1);
 }
 
+#[test]
+fn manifest_hash_tracks_scope_and_revocation() {
+    let manifest_a = ResourceManifest::<DriverTag, 2, 1>::new(
+        ResourceScope {
+            driver_id: 21,
+            iommu_domain: 8,
+            binding_nonce: 1,
+        },
+        [
+            MmioDesc {
+                base: 0x1000,
+                size: 0x100,
+            },
+            MmioDesc {
+                base: 0x2000,
+                size: 0x100,
+            },
+        ],
+        2,
+        [crate::IoPortDesc {
+            port: 0x3f8,
+            count: 8,
+        }],
+        1,
+    )
+    .unwrap();
+    let mut manifest_b = ResourceManifest::<DriverTag, 2, 1>::new(
+        ResourceScope {
+            driver_id: 21,
+            iommu_domain: 8,
+            binding_nonce: 2,
+        },
+        [
+            MmioDesc {
+                base: 0x1000,
+                size: 0x100,
+            },
+            MmioDesc {
+                base: 0x2000,
+                size: 0x100,
+            },
+        ],
+        2,
+        [crate::IoPortDesc {
+            port: 0x3f8,
+            count: 8,
+        }],
+        1,
+    )
+    .unwrap();
+    assert_ne!(manifest_a.compute_hash(), manifest_b.compute_hash());
+    manifest_b.revoke_mmio(1).unwrap();
+    assert_ne!(manifest_a.compute_hash(), manifest_b.compute_hash());
+}
+
+#[test]
+fn manifest_canonical_serialization_is_stable() {
+    let manifest = ResourceManifest::<DriverTag, 1, 1>::new(
+        ResourceScope {
+            driver_id: 33,
+            iommu_domain: 5,
+            binding_nonce: 99,
+        },
+        [MmioDesc {
+            base: 0xfeed_0000,
+            size: 0x1000,
+        }],
+        1,
+        [crate::IoPortDesc {
+            port: 0x2f8,
+            count: 8,
+        }],
+        1,
+    )
+    .unwrap();
+    let mut buf = [0u8; 128];
+    let written = manifest.write_canonical(&mut buf).unwrap();
+    assert_eq!(written, manifest.canonical_len());
+    assert_eq!(&buf[0..8], &33u64.to_le_bytes());
+    assert_eq!(&buf[8..12], &5u32.to_le_bytes());
+}
+
+#[test]
+fn shared_virtual_addressing_requires_caps_and_pasid() {
+    let binding = IsolationBinding {
+        driver_id: 1,
+        iommu_domain: 4,
+        pasid: None,
+        mode: IsolationMode::SharedVirtualAddressing,
+        caps: PciIsolationCaps::shared_virtual_addressing(),
+    };
+    assert_eq!(binding.validate(), Err(Error::InvalidState));
+    let valid = IsolationBinding {
+        pasid: Some(17),
+        ..binding
+    };
+    assert!(valid.validate().is_ok());
+}
+
+#[test]
+fn containment_escalates_fatal_events() {
+    assert_eq!(
+        containment_decision(AerEvent {
+            severity: AerSeverity::Fatal,
+            source_id: 1,
+            status: 0,
+            header_log: [0; 4],
+        }),
+        ContainmentDecision::ResetRequired
+    );
+}
+
+#[test]
+fn measured_boot_release_gate_blocks_untrusted() {
+    let state = MeasuredBootState::<1> {
+        trust: BootTrust::Untrusted,
+        records: [MeasuredBootRecord {
+            pcr: 7,
+            digest: [0u8; 32],
+        }],
+        record_count: 1,
+    };
+    assert_eq!(state.release_gate(), Err(Error::AccessDenied));
+}
+
+#[test]
+fn attestation_freshness_rejects_stale_reports() {
+    let report = DeviceAttestationReport::<1> {
+        generated_at: 10,
+        nonce: [0u8; 32],
+        transcript_hash: [1u8; 32],
+        measurements: [SpdmMeasurement {
+            slot: 0,
+            digest: [2u8; 32],
+        }],
+        measurement_count: 1,
+    };
+    assert_eq!(report.validate_freshness(100, 8), Err(Error::Timeout));
+    assert_eq!(report.measurement(0), Some([2u8; 32]));
+}
+
+#[test]
+fn interrupt_metrics_record_quarantine_reason() {
+    let registry = MockInterruptRegistry::new(2);
+    let handler = Box::leak(Box::new(TestHandler));
+    registry
+        .register_with_budget(
+            1,
+            handler,
+            InterruptBudget {
+                max_ticks: 1,
+                max_calls: 1,
+            },
+        )
+        .unwrap();
+    assert!(registry.trigger_with_budget(1, 1).is_ok());
+    assert_eq!(
+        registry.trigger_with_budget(1, 2),
+        Err(Error::BudgetExceeded)
+    );
+    let metrics = registry.metrics(1).unwrap();
+    assert_eq!(
+        metrics.quarantine_reason,
+        Some(QuarantineReason::TimeoutFault)
+    );
+}
+
 #[cfg(miri)]
 #[test]
 fn miri_manifest_parsing_is_total() {
-    let bytes = [0u8; 64];
+    let bytes = [
+        b'I', b'S', b'M', b'2', 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+    ];
     let _ = crate::parse_manifest_blob::<DriverTag, 1, 1>(&bytes);
 }
 
@@ -232,6 +454,10 @@ fn to_hex(bytes: &[u8]) -> String {
     }
     out
 }
+
+struct DenyByDefault;
+
+impl ResourcePolicy for DenyByDefault {}
 
 #[cfg(feature = "loom")]
 mod loom_tests {
